@@ -82,6 +82,7 @@ type environment struct {
 	signer types.Signer
 
 	state     *state.StateDB // apply state changes here
+	original  *state.StateDB // verkle: keep the orignal data to prove the pre-state
 	ancestors mapset.Set     // ancestor set (used for checking uncle parent validity)
 	family    mapset.Set     // family set (used for checking uncle invalidity)
 	uncles    mapset.Set     // uncle set
@@ -692,6 +693,7 @@ func (w *worker) makeCurrent(parent *types.Block, header *types.Header) error {
 	env := &environment{
 		signer:    types.MakeSigner(w.chainConfig, header.Number),
 		state:     state,
+		original:  state.Copy(),
 		ancestors: mapset.NewSet(),
 		family:    mapset.NewSet(),
 		uncles:    mapset.NewSet(),
@@ -1039,7 +1041,26 @@ func (w *worker) commit(uncles []*types.Header, interval func(), update bool, st
 	if err != nil {
 		return err
 	}
-
+	if tr := w.current.original.GetTrie(); tr.IsVerkle() {
+		vtr := tr.(*trie.VerkleTrie)
+		keys := s.Witness().Keys()
+		kvs := s.Witness().KeyVals()
+		for _, key := range keys {
+			// XXX workaround - there is a problem in the witness creation
+			// so fix the witness creation as well.
+			v, err := vtr.TryGet(key)
+			if err != nil {
+				panic(err)
+			}
+			kvs[string(key)] = v
+		}
+		vtr.Hash()
+		p, k, err := vtr.ProveAndSerialize(s.Witness().Keys(), s.Witness().KeyVals())
+		if err != nil {
+			return err
+		}
+		block.SetVerkleProof(p, k)
+	}
 	if w.isRunning() && !w.merger.TDDReached() {
 		if interval != nil {
 			interval()

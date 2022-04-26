@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/holiman/uint256"
@@ -83,6 +84,8 @@ type TxContext struct {
 	// Message information
 	Origin   common.Address // Provides information for ORIGIN
 	GasPrice *big.Int       // Provides information for GASPRICE
+
+	Accesses *types.AccessWitness
 }
 
 // EVM is the Ethereum Virtual Machine base object and provides
@@ -125,6 +128,9 @@ type EVM struct {
 // NewEVM returns a new EVM. The returned EVM is not thread safe and should
 // only ever be used *once*.
 func NewEVM(blockCtx BlockContext, txCtx TxContext, statedb StateDB, chainConfig *params.ChainConfig, config Config) *EVM {
+	if txCtx.Accesses == nil && chainConfig.IsCancun(blockCtx.BlockNumber) {
+		txCtx.Accesses = types.NewAccessWitness()
+	}
 	evm := &EVM{
 		Context:     blockCtx,
 		TxContext:   txCtx,
@@ -140,6 +146,9 @@ func NewEVM(blockCtx BlockContext, txCtx TxContext, statedb StateDB, chainConfig
 // Reset resets the EVM with a new transaction context.Reset
 // This is not threadsafe and should only be done very cautiously.
 func (evm *EVM) Reset(txCtx TxContext, statedb StateDB) {
+	if txCtx.Accesses == nil && evm.chainConfig.IsCancun(evm.Context.BlockNumber) {
+		txCtx.Accesses = types.NewAccessWitness()
+	}
 	evm.TxContext = txCtx
 	evm.StateDB = statedb
 }
@@ -158,6 +167,19 @@ func (evm *EVM) Cancelled() bool {
 // Interpreter returns the current interpreter
 func (evm *EVM) Interpreter() *EVMInterpreter {
 	return evm.interpreter
+}
+
+// tryConsumeGas tries to subtract gas from gasPool, setting the result in gasPool
+// if subtracting more gas than remains in gasPool, set gasPool = 0 and return false
+// otherwise, do the subtraction setting the result in gasPool and return true
+func tryConsumeGas(gasPool *uint64, gas uint64) bool {
+	if *gasPool < gas {
+		*gasPool = 0
+		return false
+	}
+
+	*gasPool -= gas
+	return true
 }
 
 // Call executes the contract associated with the addr with the given input as
@@ -181,6 +203,10 @@ func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, gas 
 
 	if !evm.StateDB.Exist(addr) {
 		if !isPrecompile && evm.chainRules.IsEIP158 && value.Sign() == 0 {
+			if evm.chainConfig.IsCancun(evm.Context.BlockNumber) {
+				// proof of absence
+				tryConsumeGas(&gas, evm.Accesses.TouchAndChargeProofOfAbsence(caller.Address().Bytes()))
+			}
 			// Calling a non existing account, don't do anything, but ping the tracer
 			if evm.Config.Debug {
 				if evm.depth == 0 {
@@ -219,6 +245,7 @@ func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, gas 
 		// Initialise a new contract and set the code that is to be used by the EVM.
 		// The contract is a scoped environment for this execution context only.
 		code := evm.StateDB.GetCode(addr)
+
 		if len(code) == 0 {
 			ret, err = nil, nil // gas is unchanged
 		} else {
@@ -227,6 +254,7 @@ func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, gas 
 			// The depth-check is already done, and precompiles handled above
 			contract := NewContract(caller, AccountRef(addrCopy), value, gas)
 			contract.SetCallCode(&addrCopy, evm.StateDB.GetCodeHash(addrCopy), code)
+			contract.IsDeployment = true
 			ret, err = evm.interpreter.Run(contract, input, false)
 			gas = contract.Gas
 		}
@@ -415,6 +443,8 @@ func (c *codeAndHash) Hash() common.Hash {
 
 // create creates a new contract using code as deployment code.
 func (evm *EVM) create(caller ContractRef, codeAndHash *codeAndHash, gas uint64, value *big.Int, address common.Address, typ OpCode) ([]byte, common.Address, uint64, error) {
+	var zeroVerkleLeaf [32]byte
+
 	// Depth check execution. Fail if we're trying to execute above the
 	// limit.
 	if evm.depth > int(params.CallCreateDepth) {
@@ -444,12 +474,14 @@ func (evm *EVM) create(caller ContractRef, codeAndHash *codeAndHash, gas uint64,
 	if evm.chainRules.IsEIP158 {
 		evm.StateDB.SetNonce(address, 1)
 	}
+
 	evm.Context.Transfer(evm.StateDB, caller.Address(), address, value)
 
 	// Initialise a new contract and set the code that is to be used by the EVM.
 	// The contract is a scoped environment for this execution context only.
 	contract := NewContract(caller, AccountRef(address), value, gas)
 	contract.SetCodeOptionalHash(&address, codeAndHash)
+	contract.IsDeployment = true
 
 	if evm.Config.NoRecursion && evm.depth > 0 {
 		return nil, address, gas, nil
@@ -497,6 +529,15 @@ func (evm *EVM) create(caller ContractRef, codeAndHash *codeAndHash, gas uint64,
 		evm.StateDB.RevertToSnapshot(snapshot)
 		if err != ErrExecutionReverted {
 			contract.UseGas(contract.Gas)
+		}
+	}
+
+	if err == nil && evm.chainConfig.IsCancun(evm.Context.BlockNumber) {
+		if !contract.UseGas(evm.Accesses.TouchAndChargeContractCreateCompleted(address.Bytes()[:], value.Sign() != 0)) {
+			evm.StateDB.RevertToSnapshot(snapshot)
+			err = ErrOutOfGas
+		} else {
+			evm.Accesses.SetLeafValuesContractCreateCompleted(address.Bytes()[:], zeroVerkleLeaf[:], zeroVerkleLeaf[:])
 		}
 	}
 
